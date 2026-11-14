@@ -1,0 +1,62 @@
+# Surveillance externe de Relais Arcom, exécutée par GitHub (donc indépendante du VPS).
+# Toutes les 5 minutes : appelle <site>/healthz. Si le site ne répond pas après 3 essais,
+# envoie une notification ntfy et marque l'exécution en échec. Prévient aussi quand le site revient.
+#
+# À régler dans le dépôt (Settings > Secrets and variables > Actions) :
+#   - secret   NTFY_URL : l'adresse complète du sujet ntfy (https://ntfy.sh/...)
+#   - variable SITE_URL : l'adresse du site (facultatif, sinon la valeur par défaut ci-dessous)
+name: Surveillance du site
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:        # permet de lancer une vérification à la main (onglet Actions > Run workflow)
+
+permissions:
+  actions: read             # pour lire le résultat de la vérification précédente
+
+concurrency:
+  group: surveillance
+  cancel-in-progress: false
+
+jobs:
+  verifier:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Vérifier que le site répond
+        env:
+          SITE_URL: ${{ vars.SITE_URL }}
+          NTFY_URL: ${{ secrets.NTFY_URL }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          url="${SITE_URL:-https://arcom.duckdns.org}"
+
+          # Trois essais espacés de 20 s : une coupure d'une seconde ne déclenche rien.
+          ok=0
+          for essai in 1 2 3; do
+            if curl -fsS -m 20 -o /dev/null "$url/healthz"; then ok=1; break; fi
+            sleep 20
+          done
+
+          # Résultat de la vérification précédente : sert à ne prévenir qu'au début et à la fin d'une panne.
+          precedent=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/surveillance.yml/runs?status=completed&per_page=1" \
+            --jq '.workflow_runs[0].conclusion' 2>/dev/null || true)
+
+          prevenir() {  # $1 = priorité ntfy, $2 = message
+            if [ -z "$NTFY_URL" ]; then echo "Secret NTFY_URL absent : pas de notification."; return 0; fi
+            curl -s -m 10 -o /dev/null -H "Title: Relais Arcom" -H "Priority: $1" -d "$2" "$NTFY_URL" || true
+          }
+
+          if [ "$ok" = 1 ]; then
+            echo "Le site répond."
+            if [ "$precedent" = "failure" ]; then prevenir default "surveillance externe : le site répond de nouveau."; fi
+            exit 0
+          fi
+
+          echo "Le site ne répond pas."
+          # Première alerte au début de la panne, puis un rappel par heure tant qu'elle dure.
+          if [ "$precedent" != "failure" ] || [ "$(date -u +%M)" -lt 5 ]; then
+            prevenir high "SITE INJOIGNABLE depuis l'extérieur ($url). Le VPS, le réseau ou le nom de domaine est en panne."
+          fi
+          exit 1
